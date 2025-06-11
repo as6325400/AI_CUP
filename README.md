@@ -97,14 +97,6 @@ project/
 
 ---
 
-## 🧠 模型訓練提示
-
-- 若 GPU VRAM 不足，請考慮：
-  - 降低 batch size（預設為 128）
-  - 減少 Transformer 或 LSTM 層數
-  - 移除 Dropout 或 Attention
-
----
 
 ## 📤 測試與提交
 
