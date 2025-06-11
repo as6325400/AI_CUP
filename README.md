@@ -57,7 +57,7 @@
 
 ### 執行主程式
 ```bash
-python3 gan.py
+python3 gan_v2.py
 ```
 
 此主程式包含：
