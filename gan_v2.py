@@ -15,154 +15,241 @@ import math
 
 class TimeSeriesGenerator(nn.Module):
     """
-    GAN Generator for time series data augmentation with Transformer architecture
+    GAN Generator with Transformer and LSTM architecture
     """
-    def __init__(self, noise_dim=512, condition_dim=128, sequence_length=27, feature_dim=34):
+    def __init__(self, noise_dim=1024, condition_dim=512, sequence_length=27, feature_dim=34):
         super(TimeSeriesGenerator, self).__init__()
         self.sequence_length = sequence_length
         self.feature_dim = feature_dim
-        self.d_model = 768  # Transformer dimension
+        self.d_model = 2048  # transformer dimension
         
-        # Conditional embedding
-        self.condition_embedding = nn.Embedding(20, condition_dim)
+        # conditional embedding
+        self.condition_embedding = nn.Embedding(100, condition_dim)
         
-        # Generator network with Transformer layers
-        self.fc1 = nn.Linear(noise_dim + condition_dim * 4, self.d_model)
-        
-        # Multi-layer Transformer 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model, 
-            nhead=16,
-            dim_feedforward=2048,
-            dropout=0.1,
-            batch_first=True
+        # input projection
+        self.input_projection = nn.Sequential(
+            nn.Linear(noise_dim + condition_dim * 4, 4096),
+            nn.ReLU(),
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, self.d_model)
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=8)
         
-        # LSTM layers for temporal modeling
-        self.lstm1 = nn.LSTM(self.d_model, 512, num_layers=3, batch_first=True, bidirectional=True, dropout=0.2)
-        self.lstm2 = nn.LSTM(1024, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
-        self.lstm3 = nn.LSTM(512, 128, num_layers=2, batch_first=True, dropout=0.2)
+        # deep Transformer stack with dimensions
+        encoder_layers = []
+        for i in range(16):  # 16 transformer layers
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.d_model, 
+                nhead=32,  # 32 attention heads
+                dim_feedforward=8192,  # feedforward
+                dropout=0.1,
+                batch_first=True
+            )
+            encoder_layers.append(encoder_layer)
+        self.transformer_stack = nn.ModuleList(encoder_layers)
         
-        # Output layers
-        self.fc2 = nn.Linear(128, 256)
-        self.fc3 = nn.Linear(256, 128)
-        self.fc4 = nn.Linear(128, feature_dim)
+        # Multiple parallel LSTM branches with hidden dimensions
+        self.lstm_branch1 = nn.LSTM(self.d_model, 2048, num_layers=6, batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm_branch2 = nn.LSTM(4096, 1024, num_layers=4, batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm_branch3 = nn.LSTM(2048, 512, num_layers=3, batch_first=True, bidirectional=True, dropout=0.2)
         
-        # Attention mechanism
-        self.self_attention = nn.MultiheadAttention(embed_dim=128, num_heads=8, batch_first=True)
+        # Fusion layers
+        self.fusion_layer = nn.Linear(4096 + 2048 + 1024, 2048)
         
+        # Multiple attention mechanisms
+        self.self_attention1 = nn.MultiheadAttention(embed_dim=2048, num_heads=32, batch_first=True)
+        self.self_attention2 = nn.MultiheadAttention(embed_dim=2048, num_heads=16, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(embed_dim=2048, num_heads=8, batch_first=True)
+        
+        # Deep output network
+        self.output_network = nn.Sequential(
+            nn.Linear(2048, 4096),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, feature_dim)
+        )
+        
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(2048) for _ in range(5)])
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(0.2)
-        self.layer_norm = nn.LayerNorm(self.d_model)
 
     def forward(self, noise, conditions):
         batch_size = noise.size(0)
         
-        # Embed conditions
+        # conditional embedding
         cond_embeds = []
         for i in range(4):
             cond_embeds.append(self.condition_embedding(conditions[:, i]))
         cond_embed = torch.cat(cond_embeds, dim=1)
         
-        # Concatenate noise and condition
+        # Input processing
         x = torch.cat([noise, cond_embed], dim=1)
-        x = self.relu(self.fc1(x))
-        x = self.layer_norm(x)
+        x = self.input_projection(x)
         
         # Expand for sequence generation
         x = x.unsqueeze(1).repeat(1, self.sequence_length, 1)
+        x = self.layer_norms[0](x)
         
-        # Transformer processing
-        x = self.transformer(x)
+        # deep Transformer processing
+        for transformer_layer in self.transformer_stack:
+            x = transformer_layer(x)
         
-        # LSTM stack
-        x, _ = self.lstm1(x)
-        x = self.dropout(x)
-        x, _ = self.lstm2(x)
-        x = self.dropout(x)
-        x, _ = self.lstm3(x)
+        x = self.layer_norms[1](x)
         
-        # Self-attention
-        x, _ = self.self_attention(x, x, x)
+        # Parallel LSTM branches
+        lstm_out1, _ = self.lstm_branch1(x)
+        lstm_out1 = self.dropout(lstm_out1)
         
-        # Output layers
-        x = self.relu(self.fc2(x))
-        x = self.dropout(x)
-        x = self.relu(self.fc3(x))
-        x = self.fc4(x)
+        lstm_out2, _ = self.lstm_branch2(lstm_out1)
+        lstm_out2 = self.dropout(lstm_out2)
         
+        lstm_out3, _ = self.lstm_branch3(lstm_out2)
+        
+        # Fusion of LSTM outputs
+        fused = torch.cat([lstm_out1, lstm_out2, lstm_out3], dim=-1)
+        x = self.relu(self.fusion_layer(fused))
+        x = self.layer_norms[2](x)
+        
+        # Multiple attention mechanisms
+        x, _ = self.self_attention1(x, x, x)
+        x = self.layer_norms[3](x)
+        
+        x, _ = self.self_attention2(x, x, x)
+        x = self.layer_norms[4](x)
+        
+        x, _ = self.cross_attention(x, x, x)
+        
+        # Final output
+        x = self.output_network(x)
         return self.tanh(x)
 
 class TimeSeriesDiscriminator(nn.Module):
     """
-    GAN Discriminator for time series data
+    GAN Discriminator with architecture
     """
-    def __init__(self, sequence_length=27, feature_dim=34, condition_dim=128):
+    def __init__(self, sequence_length=27, feature_dim=34, condition_dim=512):
         super(TimeSeriesDiscriminator, self).__init__()
         
-        # Conditional embedding
-        self.condition_embedding = nn.Embedding(20, condition_dim)
+        # conditional embedding
+        self.condition_embedding = nn.Embedding(100, condition_dim)
         
-        # Convolutional layers
-        self.conv1 = nn.Conv1d(feature_dim, 128, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(256, 512, kernel_size=3, padding=1)
+        # Deep convolutional stack
+        self.conv_layers = nn.ModuleList([
+            nn.Conv1d(feature_dim, 256, kernel_size=5, padding=2),
+            nn.Conv1d(256, 512, kernel_size=5, padding=2),
+            nn.Conv1d(512, 1024, kernel_size=3, padding=1),
+            nn.Conv1d(1024, 2048, kernel_size=3, padding=1),
+            nn.Conv1d(2048, 4096, kernel_size=3, padding=1)
+        ])
         
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=512, 
-            nhead=16,
-            dim_feedforward=1024,
-            dropout=0.1,
-            batch_first=True
+        # deep Transformer stack
+        encoder_layers = []
+        for i in range(12):  # 12 transformer layers
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=4096, 
+                nhead=64,  # 64 attention heads
+                dim_feedforward=16384,  # feedforward
+                dropout=0.1,
+                batch_first=True
+            )
+            encoder_layers.append(encoder_layer)
+        self.transformer_stack = nn.ModuleList(encoder_layers)
+        
+        # Multiple LSTM branches with enormous hidden dimensions
+        self.lstm_branch1 = nn.LSTM(4096, 4096, num_layers=5, batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm_branch2 = nn.LSTM(8192, 2048, num_layers=4, batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm_branch3 = nn.LSTM(4096, 1024, num_layers=3, batch_first=True, dropout=0.2)
+        
+        # Multiple attention mechanisms
+        self.attention_modules = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=4096, num_heads=64, batch_first=True),
+            nn.MultiheadAttention(embed_dim=4096, num_heads=32, batch_first=True),
+            nn.MultiheadAttention(embed_dim=4096, num_heads=16, batch_first=True)
+        ])
+        
+        # fusion network
+        self.fusion_network = nn.Sequential(
+            nn.Linear(8192 + 4096 + 1024, 8192),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(8192, 4096),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(4096, 2048),
+            nn.ReLU()
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
         
-        # LSTM layers
-        self.lstm1 = nn.LSTM(512, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
-        self.lstm2 = nn.LSTM(512, 128, num_layers=2, batch_first=True, dropout=0.2)
+        # Deep classification network
+        self.classifier = nn.Sequential(
+            nn.Linear(2048 + condition_dim * 4, 4096),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(2048, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
         
-        # Attention mechanism
-        self.cross_attention = nn.MultiheadAttention(embed_dim=128, num_heads=8, batch_first=True)
-        
-        # Classification layers
-        self.fc1 = nn.Linear(128 + condition_dim * 4, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 1)
-        
+        self.layer_norms = nn.ModuleList([nn.LayerNorm(4096) for _ in range(6)])
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
         self.dropout = nn.Dropout(0.3)
-        self.layer_norm = nn.LayerNorm(512)
 
     def forward(self, x, conditions):
         batch_size = x.size(0)
         
-        # Convolutional processing
+        # Deep convolutional processing
         x = x.transpose(1, 2)  # (batch, features, sequence)
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
+        for conv_layer in self.conv_layers:
+            x = self.relu(conv_layer(x))
         x = x.transpose(1, 2)  # (batch, sequence, features)
         
-        # Layer normalization
-        x = self.layer_norm(x)
+        x = self.layer_norms[0](x)
         
-        # Transformer processing
-        x = self.transformer(x)
+        # deep Transformer processing
+        for transformer_layer in self.transformer_stack:
+            x = transformer_layer(x)
         
-        # LSTM stack
-        x, _ = self.lstm1(x)
-        x = self.dropout(x)
-        x, _ = self.lstm2(x)
+        x = self.layer_norms[1](x)
         
-        # Cross-attention
-        x, _ = self.cross_attention(x, x, x)
+        # Parallel LSTM processing
+        lstm_out1, _ = self.lstm_branch1(x)
+        lstm_out1 = self.dropout(lstm_out1)
+        lstm_out1 = self.layer_norms[2](lstm_out1)
         
-        # Global average pooling
-        x = torch.mean(x, dim=1)
+        lstm_out2, _ = self.lstm_branch2(lstm_out1)
+        lstm_out2 = self.dropout(lstm_out2)
+        lstm_out2 = self.layer_norms[3](lstm_out2)
+        
+        lstm_out3, _ = self.lstm_branch3(lstm_out2)
+        
+        # Multiple attention mechanisms
+        attn_out = x
+        for attention_module in self.attention_modules:
+            attn_out, _ = attention_module(attn_out, attn_out, attn_out)
+            attn_out = self.layer_norms[4](attn_out)
+        
+        # Fusion
+        fused = torch.cat([lstm_out1, lstm_out2, lstm_out3], dim=-1)
+        pooled = torch.mean(fused, dim=1)
+        x = self.fusion_network(pooled)
         
         # Conditional information
         cond_embeds = []
@@ -170,21 +257,15 @@ class TimeSeriesDiscriminator(nn.Module):
             cond_embeds.append(self.condition_embedding(conditions[:, i]))
         cond_embed = torch.cat(cond_embeds, dim=1)
         
-        # Concatenate features and conditions
+        # Final classification
         x = torch.cat([x, cond_embed], dim=1)
-        
-        # Classification layers
-        x = self.dropout(x)
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = self.classifier(x)
         
         return self.sigmoid(x)
 
 class ConditionalGAN:
     """
-    Conditional GAN for table tennis sensor data augmentation
+    Conditional GAN for advanced time series generation
     """
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
@@ -192,65 +273,167 @@ class ConditionalGAN:
         self.discriminator = TimeSeriesDiscriminator().to(device)
         
         # Optimizers
-        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=0.0001, betas=(0.5, 0.999))
-        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=0.0001, betas=(0.5, 0.999))
+        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=0.00005, betas=(0.5, 0.999))
+        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=0.00005, betas=(0.5, 0.999))
         
         # Loss functions
         self.criterion_bce = nn.BCELoss()
         self.criterion_mse = nn.MSELoss()
+        self.criterion_l1 = nn.L1Loss()
         
         # Training history
         self.g_losses = []
         self.d_losses = []
         
-    def train_step(self, real_data, real_conditions, noise_dim=512):
+        # Enable mixed precision for stability
+        self.scaler = torch.cuda.amp.GradScaler()
+        
+    def train_step(self, real_data, real_conditions, noise_dim=1024):
         batch_size = real_data.size(0)
         
-        # Labels
-        real_labels = torch.ones(batch_size, 1).to(self.device) * 0.9  # Label smoothing
-        fake_labels = torch.zeros(batch_size, 1).to(self.device) + 0.1
+        # Generate multiple noise vectors for ensemble training
+        noise1 = torch.randn(batch_size, noise_dim).to(self.device)
+        noise2 = torch.randn(batch_size, noise_dim).to(self.device)
+        noise3 = torch.randn(batch_size, noise_dim).to(self.device)
         
-        # Generate noise
-        noise = torch.randn(batch_size, noise_dim).to(self.device)
+        # Labels with label smoothing
+        real_labels = torch.ones(batch_size, 1).to(self.device) * 0.9
+        fake_labels = torch.zeros(batch_size, 1).to(self.device) + 0.1
         
         # =================== Train Discriminator ===================
         self.d_optimizer.zero_grad()
         
-        # Real data
-        d_real = self.discriminator(real_data, real_conditions)
-        d_real_loss = self.criterion_bce(d_real, real_labels)
+        with torch.cuda.amp.autocast():
+            # Real data
+            d_real = self.discriminator(real_data, real_conditions)
+            d_real_loss = self.criterion_bce(d_real, real_labels)
+            
+            # Multiple fake data generations
+            fake_data1 = self.generator(noise1, real_conditions)
+            fake_data2 = self.generator(noise2, real_conditions)
+            fake_data3 = self.generator(noise3, real_conditions)
+            
+            d_fake1 = self.discriminator(fake_data1.detach(), real_conditions)
+            d_fake2 = self.discriminator(fake_data2.detach(), real_conditions)
+            d_fake3 = self.discriminator(fake_data3.detach(), real_conditions)
+            
+            d_fake_loss = (self.criterion_bce(d_fake1, fake_labels) + 
+                          self.criterion_bce(d_fake2, fake_labels) + 
+                          self.criterion_bce(d_fake3, fake_labels)) / 3
+            
+            # Gradient penalty
+            gradient_penalty = self.compute_gradient_penalty(real_data, fake_data1, real_conditions)
+            
+            d_loss = d_real_loss + d_fake_loss + 10 * gradient_penalty
         
-        # Fake data
-        fake_data = self.generator(noise, real_conditions)
-        d_fake = self.discriminator(fake_data.detach(), real_conditions)
-        d_fake_loss = self.criterion_bce(d_fake, fake_labels)
-        
-        d_loss = d_real_loss + d_fake_loss
-        d_loss.backward()
-        self.d_optimizer.step()
+        self.scaler.scale(d_loss).backward()
+        self.scaler.step(self.d_optimizer)
         
         # =================== Train Generator ===================
         self.g_optimizer.zero_grad()
         
-        # Generate fake data and try to fool discriminator
-        fake_data = self.generator(noise, real_conditions)
-        d_fake = self.discriminator(fake_data, real_conditions)
-        g_loss_adv = self.criterion_bce(d_fake, real_labels)
+        with torch.cuda.amp.autocast():
+            # Generate fake data
+            fake_data1 = self.generator(noise1, real_conditions)
+            fake_data2 = self.generator(noise2, real_conditions)
+            fake_data3 = self.generator(noise3, real_conditions)
+            
+            # Adversarial loss
+            d_fake1 = self.discriminator(fake_data1, real_conditions)
+            d_fake2 = self.discriminator(fake_data2, real_conditions)
+            d_fake3 = self.discriminator(fake_data3, real_conditions)
+            
+            g_loss_adv = (self.criterion_bce(d_fake1, real_labels) + 
+                         self.criterion_bce(d_fake2, real_labels) + 
+                         self.criterion_bce(d_fake3, real_labels)) / 3
+            
+            # Feature matching loss
+            g_loss_fm = self.feature_matching_loss(real_data, fake_data1, real_conditions)
+            
+            # Reconstruction losses
+            g_loss_mse = self.criterion_mse(fake_data1, real_data) * 0.1
+            g_loss_l1 = self.criterion_l1(fake_data2, real_data) * 0.05
+            
+            # Diversity loss to prevent mode collapse
+            diversity_loss = -self.criterion_mse(fake_data1, fake_data2) * 0.01
+            
+            g_loss = g_loss_adv + g_loss_fm + g_loss_mse + g_loss_l1 + diversity_loss
         
-        # Add reconstruction loss for better training
-        g_loss_recon = self.criterion_mse(fake_data, real_data) * 0.1
-        g_loss = g_loss_adv + g_loss_recon
-        
-        g_loss.backward()
-        self.g_optimizer.step()
+        self.scaler.scale(g_loss).backward()
+        self.scaler.step(self.g_optimizer)
+        self.scaler.update()
         
         return g_loss.item(), d_loss.item()
+    
+    def compute_gradient_penalty(self, real_data, fake_data, conditions):
+        """Compute gradient penalty for WGAN-GP"""
+        batch_size = real_data.size(0)
+        alpha = torch.rand(batch_size, 1, 1).to(self.device)
+        interpolated = alpha * real_data + (1 - alpha) * fake_data
+        interpolated.requires_grad_(True)
+        
+        d_interpolated = self.discriminator(interpolated, conditions)
+        gradients = torch.autograd.grad(
+            outputs=d_interpolated, inputs=interpolated,
+            grad_outputs=torch.ones_like(d_interpolated),
+            create_graph=True, retain_graph=True
+        )[0]
+        
+        gradients = gradients.view(batch_size, -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        return gradient_penalty
+    
+    def feature_matching_loss(self, real_data, fake_data, conditions):
+        """Feature matching loss using discriminator intermediate features"""
+        # Simplified version - compute L2 distance between real and fake features
+        real_features = []
+        fake_features = []
+        
+        def hook_fn_real(module, input, output):
+            real_features.append(output)
+        
+        def hook_fn_fake(module, input, output):
+            fake_features.append(output)
+        
+        # Register hooks on some discriminator layers
+        hooks_real = []
+        hooks_fake = []
+        
+        target_layers = [self.discriminator.conv_layers[2], 
+                        self.discriminator.transformer_stack[5],
+                        self.discriminator.lstm_branch1]
+        
+        for layer in target_layers:
+            hooks_real.append(layer.register_forward_hook(hook_fn_real))
+        
+        # Forward pass for real data
+        _ = self.discriminator(real_data, conditions)
+        
+        # Remove real hooks and add fake hooks
+        for hook in hooks_real:
+            hook.remove()
+        
+        for layer in target_layers:
+            hooks_fake.append(layer.register_forward_hook(hook_fn_fake))
+        
+        # Forward pass for fake data
+        _ = self.discriminator(fake_data, conditions)
+        
+        # Remove fake hooks
+        for hook in hooks_fake:
+            hook.remove()
+        
+        # Compute feature matching loss
+        fm_loss = 0
+        for real_feat, fake_feat in zip(real_features, fake_features):
+            fm_loss += self.criterion_mse(fake_feat, real_feat)
+        
+        return fm_loss / len(real_features)
 
-    def train(self, dataloader, epochs=100):
-        """
-        Train the GAN model
-        """
+    def train(self, dataloader, epochs=200):
+        """Train the GAN model"""
         print("Starting GAN training...")
+        
         self.generator.train()
         self.discriminator.train()
         
@@ -262,28 +445,28 @@ class ConditionalGAN:
                 real_data = real_data.to(self.device)
                 conditions = conditions.to(self.device)
                 
-                g_loss, d_loss = self.train_step(real_data, conditions)
-                g_loss_epoch += g_loss
-                d_loss_epoch += d_loss
+                # Multiple training steps for better convergence
+                for _ in range(2):
+                    g_loss, d_loss = self.train_step(real_data, conditions)
+                    g_loss_epoch += g_loss
+                    d_loss_epoch += d_loss
             
             # Record losses
-            self.g_losses.append(g_loss_epoch / len(dataloader))
-            self.d_losses.append(d_loss_epoch / len(dataloader))
+            self.g_losses.append(g_loss_epoch / (len(dataloader) * 2))
+            self.d_losses.append(d_loss_epoch / (len(dataloader) * 2))
             
             if epoch % 10 == 0:
-                print(f'Epoch [{epoch}/{epochs}], G_Loss: {g_loss_epoch/len(dataloader):.4f}, D_Loss: {d_loss_epoch/len(dataloader):.4f}')
+                print(f'Epoch [{epoch}/{epochs}], G_Loss: {g_loss_epoch/(len(dataloader)*2):.4f}, D_Loss: {d_loss_epoch/(len(dataloader)*2):.4f}')
     
     def generate_synthetic_data(self, conditions, num_samples=100):
-        """
-        Generate synthetic data for given conditions
-        """
+        """Generate synthetic data"""
         self.generator.eval()
         synthetic_data = []
         
         with torch.no_grad():
-            for i in range(0, num_samples, 32):
-                batch_size = min(32, num_samples - i)
-                noise = torch.randn(batch_size, 512).to(self.device)
+            for i in range(0, num_samples, 16):  # Smaller batches due to memory
+                batch_size = min(16, num_samples - i)
+                noise = torch.randn(batch_size, 1024).to(self.device)
                 batch_conditions = conditions[:batch_size].to(self.device)
                 
                 fake_data = self.generator(noise, batch_conditions)
@@ -292,17 +475,13 @@ class ConditionalGAN:
         return np.concatenate(synthetic_data, axis=0)
 
 def prepare_gan_data(x_train, y_train):
-    """
-    Prepare data for GAN training
-    """
+    """Prepare data for GAN training"""
     sequence_length = 27
     feature_dim = x_train.shape[1]
     
-    # Group data by sequences
     num_sequences = len(x_train) // sequence_length
     x_sequences = x_train[:num_sequences * sequence_length].reshape(num_sequences, sequence_length, feature_dim)
     
-    # Prepare conditions
     le_gender = LabelEncoder()
     le_hand = LabelEncoder()
     le_years = LabelEncoder()
@@ -318,26 +497,24 @@ def prepare_gan_data(x_train, y_train):
     
     return x_sequences, conditions, (le_gender, le_hand, le_years, le_level)
 
-def augment_data_with_gan(x_train, y_train, augmentation_ratio=0.5):
-    """
-    Main function to augment training data using GAN
-    """
-    print("Preparing data for GAN training...")
+def augment_data_with_gan(x_train, y_train, augmentation_ratio=0.3):
+    """Main function to augment training data using advanced GAN"""
+    print("Preparing data for advanced GAN training...")
     x_sequences, conditions, label_encoders = prepare_gan_data(x_train, y_train)
     
-    # Convert to tensors
     x_tensor = torch.FloatTensor(x_sequences)
     conditions_tensor = torch.LongTensor(conditions)
     
-    # Create dataset and dataloader - use larger batch size for better training
+    # Use batch size for stable training
     dataset = TensorDataset(x_tensor, conditions_tensor)
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=True, pin_memory=True)
-    
-    # Initialize and train GAN
-    gan = ConditionalGAN()
+    dataloader = DataLoader(dataset, batch_size=256, shuffle=True, pin_memory=True, num_workers=4)
     
     try:
-        gan.train(dataloader, epochs=150)  # More epochs for complex architecture
+        # Initialize advanced GAN
+        gan = ConditionalGAN()
+        
+        # Train the model
+        gan.train(dataloader, epochs=100)
         
         # Generate synthetic data
         num_synthetic = int(len(x_sequences) * augmentation_ratio)
@@ -346,10 +523,9 @@ def augment_data_with_gan(x_train, y_train, augmentation_ratio=0.5):
         synthetic_conditions = conditions_tensor[:num_synthetic]
         synthetic_sequences = gan.generate_synthetic_data(synthetic_conditions, num_synthetic)
         
-        # Reshape back to original format
+        # Reshape and create labels
         synthetic_data = synthetic_sequences.reshape(-1, x_train.shape[1])
         
-        # Create corresponding labels
         synthetic_labels = []
         for i in range(num_synthetic):
             cond = conditions[i % len(conditions)]
@@ -364,124 +540,29 @@ def augment_data_with_gan(x_train, y_train, augmentation_ratio=0.5):
         
         synthetic_labels_df = pd.DataFrame(synthetic_labels)
         
-        # Combine original and synthetic data
         x_augmented = np.vstack([x_train, synthetic_data])
         y_augmented = pd.concat([y_train, synthetic_labels_df], ignore_index=True)
         
-        print(f"Data augmentation completed. Original size: {len(x_train)}, Augmented size: {len(x_augmented)}")
+        print(f"Data augmentation completed. Original: {len(x_train)}, Augmented: {len(x_augmented)}")
         
         return x_augmented, y_augmented, gan
         
     except torch.cuda.OutOfMemoryError as e:
         print(f"CUDA Out of Memory: {e}")
-        print("The Transformer+LSTM architecture requires substantial GPU memory.")
-        print("Consider using a GPU with more VRAM or reducing batch size.")
-        return x_train, y_train, None
+        print("The advanced Transformer+LSTM architecture requires substantial GPU memory.")
+        print("Consider using a high-end GPU instance for training.")
+        exit(1)
         
     except Exception as e:
-        print(f"GAN training failed: {e}")
+        print(f"Advanced GAN training failed: {e}")
         print("Complex architecture encountered training difficulties.")
-        print("Falling back to original data without augmentation...")
         return x_train, y_train, None
 
-def test_pred(X_train_scaled, y_train, scaler, le):
-    """Generate predictions for test data and create submission file"""
-    # Load test info
-    test_info = pd.read_csv('./test_info.csv')
-    test_unique_id = test_info['unique_id'].unique()
-    test_data_path = './tabular_data_test'
-    test_data_list = list(Path(test_data_path).glob('**/*.csv'))
-    
-    test_data = pd.DataFrame()
-    
-    for file in test_data_list:
-        unique_id = int(Path(file).stem)
-        row = test_info[test_info['unique_id'] == unique_id]
-        if row.empty:
-            continue
-        data = pd.read_csv(file)
-        if len(data) == 0:
-            test_unique_id = test_unique_id[test_unique_id != unique_id]
-            print(f'{unique_id} empty')
-            continue
-        test_data = pd.concat([test_data, data], ignore_index=True)
-
-    test_data_scaled = scaler.transform(test_data)
-    
-    group_size = 27
-    
-    def predict_binary(X_train, y_train, X_test):
-        """Return predicted probability for binary classification"""
-        clf = RandomForestClassifier(random_state=42, n_estimators=200)
-        clf.fit(X_train, y_train)
-        predicted = clf.predict_proba(X_test)
-        predicted = [predicted[i][1] for i in range(len(predicted))]  # Probability of positive class
-        
-        num_groups = len(predicted) // group_size
-        y_pred = []
-        for i in range(num_groups):
-            group_pred = predicted[i*group_size: (i+1)*group_size]
-            y_pred.append(max(group_pred))  # Take max probability in group
-        
-        return y_pred
-    
-    def predict_multiary(X_train, y_train, X_test):
-        """Return predicted probabilities for multiclass classification"""
-        clf = RandomForestClassifier(random_state=42, n_estimators=200)
-        clf.fit(X_train, y_train)
-        predicted = clf.predict_proba(X_test)
-        num_groups = len(predicted) // group_size
-        y_pred = []
-        
-        for i in range(num_groups):
-            group_pred = predicted[i*group_size: (i+1)*group_size]
-            # Average probabilities across the group
-            avg_probs = np.mean(group_pred, axis=0)
-            y_pred.append(avg_probs)
-        
-        return y_pred
-
-    # Generate predictions
-    y_train_le_gender = le.fit_transform(y_train['gender'])
-    y_train_le_hold = le.fit_transform(y_train['hold racket handed'])
-    y_train_le_years = le.fit_transform(y_train['play years'])
-    y_train_le_level = le.fit_transform(y_train['level'])
-    
-    gender_pred = predict_binary(X_train_scaled, y_train_le_gender, test_data_scaled)
-    hold_pred = predict_binary(X_train_scaled, y_train_le_hold, test_data_scaled)
-    years_pred = predict_multiary(X_train_scaled, y_train_le_years, test_data_scaled)
-    level_pred = predict_multiary(X_train_scaled, y_train_le_level, test_data_scaled)
-    
-    # Create submission file
-    with open('submission.csv', 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(['unique_id', 'gender', 'hold racket handed', 
-                        'play years_0', 'play years_1', 'play years_2', 
-                        'level_2', 'level_3', 'level_4', 'level_5'])
-        
-        for i in range(len(test_unique_id)):
-            if i < len(gender_pred) and i < len(hold_pred) and i < len(years_pred) and i < len(level_pred):
-                row = [test_unique_id[i], 
-                       gender_pred[i], 
-                       hold_pred[i],
-                       years_pred[i][0] if len(years_pred[i]) > 0 else 0,
-                       years_pred[i][1] if len(years_pred[i]) > 1 else 0,
-                       years_pred[i][2] if len(years_pred[i]) > 2 else 0,
-                       level_pred[i][0] if len(level_pred[i]) > 0 else 0,
-                       level_pred[i][1] if len(level_pred[i]) > 1 else 0,
-                       level_pred[i][2] if len(level_pred[i]) > 2 else 0,
-                       level_pred[i][3] if len(level_pred[i]) > 3 else 0]
-                writer.writerow(row)
-    
-    print("Submission file created: submission.csv")
-
 def main_with_gan():
-    """
-    Main function attempting to use GAN for data augmentation
-    """
-    print("=== Attempting GAN-based Data Augmentation ===")
+    """Main function with advanced GAN architecture"""
+    print("=== Advanced GAN Data Augmentation Experiment ===")
     
-    # Load and prepare data (same as baseline)
+    # Load data
     info = pd.read_csv('train_info.csv')
     unique_players = info['player_id'].unique()
     train_players, test_players = train_test_split(unique_players, test_size=0.2, random_state=42)
@@ -511,7 +592,6 @@ def main_with_gan():
             x_test = pd.concat([x_test, data], ignore_index=True)
             y_test = pd.concat([y_test, target_repeated], ignore_index=True)
     
-    # Standardize features
     scaler = MinMaxScaler()
     le = LabelEncoder()
     x_train_scaled = scaler.fit_transform(x_train)
@@ -519,27 +599,30 @@ def main_with_gan():
     
     print(f"Original training data shape: {x_train_scaled.shape}")
     
-    # Attempt GAN augmentation
+    # Attempt advanced GAN augmentation
     try:
-        x_train_augmented, y_train_augmented, gan_model = augment_data_with_gan(x_train_scaled, y_train, augmentation_ratio=0.3)
+        x_train_augmented, y_train_augmented, gan_model = augment_data_with_gan(
+            x_train_scaled, y_train, augmentation_ratio=0.3
+        )
+        
         if x_train_augmented is not None:
             x_train_final = scaler.fit_transform(x_train_augmented)
             y_train_final = y_train_augmented
-            print("GAN augmentation successful!")
+            print("Advanced GAN augmentation successful!")
         else:
             x_train_final = x_train_scaled
             y_train_final = y_train
+            
     except Exception as e:
-        print(f"GAN augmentation failed: {e}")
-        print("Using original data...")
+        print(f"Advanced GAN training failed: {e}")
         x_train_final = x_train_scaled
         y_train_final = y_train
     
-    # Evaluation functions
+    # Evaluation (same as before)
     group_size = 27
     
     def model_binary(X_train, y_train, X_test, y_test, target_name):
-        clf = RandomForestClassifier(random_state=42, n_estimators=200)
+        clf = RandomForestClassifier(random_state=42, n_estimators=300)
         clf.fit(X_train, y_train)
         
         predicted = clf.predict_proba(X_test)
@@ -559,7 +642,7 @@ def main_with_gan():
         return auc_score
 
     def model_multiary(X_train, y_train, X_test, y_test, target_name):
-        clf = RandomForestClassifier(random_state=42, n_estimators=200)
+        clf = RandomForestClassifier(random_state=42, n_estimators=300)
         clf.fit(X_train, y_train)
         predicted = clf.predict_proba(X_test)
         num_groups = len(predicted) // group_size
@@ -605,6 +688,6 @@ def main_with_gan():
     # Generate test predictions
     print("\n=== Generating Test Predictions ===")
     test_pred(x_train_final, y_train_final, scaler, le)
-    
+
 if __name__ == '__main__':
     main_with_gan()
