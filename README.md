@@ -57,7 +57,7 @@
 
 ### 執行主程式
 ```bash
-python gan.py
+python3 gan.py
 ```
 
 此主程式包含：
@@ -104,7 +104,7 @@ project/
 
 ```csv
 unique_id,gender,hold racket handed,play years_0,...,level_5
-1001,0.65,0.72,0.12,...,0.33
+1968,0.65,0.72,0.12,...,0.33
 ...
 ```
 
